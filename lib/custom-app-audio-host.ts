@@ -34,6 +34,7 @@ const listeners = new Set<() => void>();
 let floatRoot: HTMLDivElement | null = null;
 let floatCard: HTMLDivElement | null = null;
 let floatStyle: HTMLStyleElement | null = null;
+let floatDrag: { pointerId: number; startX: number; startY: number; origLeft: number; origTop: number; moved: boolean } | null = null;
 
 function normalizeChannelName(value: unknown): string {
   return String(value ?? "voice") === "ambience" ? "ambience" : "voice";
@@ -257,8 +258,8 @@ function ensureFloatStyle(): void {
   if (floatStyle) return;
   const style = document.createElement("style");
   style.textContent = `
-  .caa-float{position:fixed;left:14px;bottom:calc(20px + env(safe-area-inset-bottom,0px));z-index:2147483000;display:flex;align-items:center;gap:8px;}
-  .caa-float-dot{width:48px;height:48px;border-radius:50%;border:none;background:rgba(22,22,28,.92);color:#fff;box-shadow:0 6px 18px rgba(0,0,0,.35),0 0 0 1px rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;cursor:pointer;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);}
+  .caa-float{position:fixed;left:14px;z-index:2147483000;display:flex;align-items:center;gap:8px;}
+  .caa-float-dot{width:48px;height:48px;border-radius:50%;border:none;background:rgba(22,22,28,.92);color:#fff;box-shadow:0 6px 18px rgba(0,0,0,.35),0 0 0 1px rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;cursor:grab;touch-action:none;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);}
   .caa-float-dot:active{transform:scale(.95);}
   .caa-float-card{display:none;max-width:210px;background:rgba(22,22,28,.94);color:#eee;border-radius:14px;padding:10px 12px;box-shadow:0 8px 24px rgba(0,0,0,.4);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);}
   .caa-float-card[data-open]{display:block;}
@@ -291,15 +292,48 @@ function syncFloat(): void {
   if (!floatRoot) {
     const root = document.createElement("div");
     root.className = "caa-float";
+    root.style.left = "14px";
+    root.style.top = Math.max(8, window.innerHeight - 100) + "px";
     const dot = document.createElement("button");
     dot.type = "button";
     dot.className = "caa-float-dot";
     dot.setAttribute("aria-label", "自定义应用音频");
     dot.innerHTML =
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
-    dot.addEventListener("click", () => {
-      if (floatCard) floatCard.toggleAttribute("data-open");
+    dot.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      try { dot.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+      const rect = root.getBoundingClientRect();
+      floatDrag = {
+        pointerId: e.pointerId,
+        startX: e.clientX,
+        startY: e.clientY,
+        origLeft: rect.left,
+        origTop: rect.top,
+        moved: false,
+      };
     });
+    dot.addEventListener("pointermove", (e) => {
+      if (!floatDrag || floatDrag.pointerId !== e.pointerId) return;
+      const dx = e.clientX - floatDrag.startX;
+      const dy = e.clientY - floatDrag.startY;
+      if (Math.abs(dx) > 6 || Math.abs(dy) > 6) floatDrag.moved = true;
+      if (floatDrag.moved) {
+        const w = root.offsetWidth || 48;
+        const h = root.offsetHeight || 48;
+        const x = Math.max(0, Math.min(window.innerWidth - w, floatDrag.origLeft + dx));
+        const y = Math.max(0, Math.min(window.innerHeight - h, floatDrag.origTop + dy));
+        root.style.left = x + "px";
+        root.style.top = y + "px";
+      }
+    });
+    const finishDrag = (e: PointerEvent) => {
+      const wasDrag = Boolean(floatDrag && floatDrag.moved && floatDrag.pointerId === e.pointerId);
+      floatDrag = null;
+      if (!wasDrag && floatCard) floatCard.toggleAttribute("data-open");
+    };
+    dot.addEventListener("pointerup", finishDrag);
+    dot.addEventListener("pointercancel", () => { floatDrag = null; });
     const card = document.createElement("div");
     card.className = "caa-float-card";
     card.innerHTML =
@@ -307,13 +341,13 @@ function syncFloat(): void {
       '<div class="caa-float-sub">—</div>' +
       '<div class="caa-float-btns">' +
       '<button type="button" class="caa-float-btn" data-act="toggle">暂停</button>' +
-      '<button type="button" class="caa-float-btn caa-float-btn-stop" data-act="stop">停止</button>' +
+      '<button type="button" class="caa-float-btn caa-float-btn-stop" data-act="exit">退出</button>' +
       '</div>';
     card.querySelector<HTMLButtonElement>('[data-act="toggle"]')?.addEventListener("click", () => {
       if (getCustomAppAudioSnapshot().isPlaying) customAppAudioPause("voice");
       else customAppAudioResume("voice");
     });
-    card.querySelector<HTMLButtonElement>('[data-act="stop"]')?.addEventListener("click", stopVoice);
+    card.querySelector<HTMLButtonElement>('[data-act="exit"]')?.addEventListener("click", stopVoice);
     root.appendChild(dot);
     root.appendChild(card);
     document.body.appendChild(root);
