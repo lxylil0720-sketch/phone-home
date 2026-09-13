@@ -29,6 +29,14 @@ import {
 } from "@/lib/chat-storage";
 import { deleteMediaRef, isMediaStoreRef, loadMediaBlob, storeMediaBase64 } from "@/lib/media-cache-storage";
 import {
+  customAppAudioMarkAppClosed,
+  customAppAudioMarkAppOpen,
+  customAppAudioPause,
+  customAppAudioPlay,
+  customAppAudioResume,
+  customAppAudioStop,
+} from "@/lib/custom-app-audio-host";
+import {
   addCustomAppMemory,
   addCustomAppTimelineEvent,
   activateCustomAppWorld,
@@ -573,53 +581,6 @@ function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
-// ── 宿主代播(voice.play)──
-// APP 沙盒 iframe 里的 <audio> 会让 iOS 锁屏媒体卡片绑到 about:srcdoc(点了
-// 就把 PWA 导航到空白页);而 Web Audio 又会被 iOS 静音拨键掐掉输出。所以
-// 播放必须由宿主页面持有的 <audio> 元素来做:卡片绑到站点本身,点击无害,
-// 静音拨键也不影响媒体元素。
-type FrameAudioChannel = { el: HTMLAudioElement; settle: (() => void) | null; objectUrl: string | null };
-
-const FRAME_AUDIO_UNLOCK_WAV = "data:audio/wav;base64,UklGRjQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YRAAAACAgICAgICAgICAgICAgICA";
-
-function normalizeFrameAudioChannelName(value: unknown): string {
-  return String(value ?? "voice") === "ambience" ? "ambience" : "voice";
-}
-
-function cleanupFrameAudioChannel(entry: FrameAudioChannel): void {
-  const el = entry.el;
-  el.onended = null;
-  el.onerror = null;
-  el.loop = false;
-  // 清掉 src 让 iOS 撤下锁屏媒体卡片
-  try { el.pause(); el.removeAttribute("src"); el.load(); } catch { /* ignore */ }
-  if (entry.objectUrl) {
-    try { URL.revokeObjectURL(entry.objectUrl); } catch { /* ignore */ }
-    entry.objectUrl = null;
-  }
-}
-
-// iOS 的播放解锁按元素记账:在用户手势窗口里让元素静音播一次,之后
-// 程序化 play() 才不会被自动播放策略拦截。
-function unlockFrameAudioEl(el: HTMLAudioElement): void {
-  if (el.dataset.unlocked === "1") return;
-  try {
-    el.muted = true;
-    el.src = FRAME_AUDIO_UNLOCK_WAV;
-    const p = el.play();
-    if (p && typeof p.then === "function") {
-      p.then(() => {
-        try { el.pause(); el.removeAttribute("src"); el.load(); } catch { /* ignore */ }
-        el.muted = false;
-        el.dataset.unlocked = "1";
-      }).catch(() => { el.muted = false; });
-    } else {
-      el.muted = false;
-      el.dataset.unlocked = "1";
-    }
-  } catch { /* 解锁失败不阻断,播放时 APP 侧还有回落 */ }
-}
-
 function ensureCharacterSession(characterId: string) {
   const contacts = loadChatContacts();
   if (!contacts.some(contact => contact.characterId === characterId)) {
@@ -818,8 +779,6 @@ export function CustomAppRunner({
     reject: (error: Error) => void;
   }>>(new Map());
   const registeredToolHandlersRef = useRef<Set<string>>(new Set());
-  const frameAudioChannelsRef = useRef<Map<string, FrameAudioChannel>>(new Map());
-  const frameObjectUrlsRef = useRef<Set<string>>(new Set());
   const onlineRoomRef = useRef<OnlineRoomConnection | null>(null);
 
   // 联机房间随 APP 生命周期走：关 APP 即退房（房主退房 = 关房）
@@ -885,45 +844,13 @@ export function CustomAppRunner({
     };
   }, [syncHostedSafeArea]);
 
-  const getFrameAudioChannel = useCallback((name: string): FrameAudioChannel => {
-    let entry = frameAudioChannelsRef.current.get(name);
-    if (!entry) {
-      const el = new Audio();
-      el.setAttribute("playsinline", "");
-      entry = { el, settle: null, objectUrl: null };
-      frameAudioChannelsRef.current.set(name, entry);
-    }
-    return entry;
-  }, []);
-
-  // 挂载发生在"打开 APP"那次点击的任务内(useLayoutEffect 同步执行),趁手势
-  // 窗口把代播元素解锁;之后宿主层的任何触摸(如返回胶囊)也会补解锁。
-  useLayoutEffect(() => {
-    const unlockAll = () => {
-      unlockFrameAudioEl(getFrameAudioChannel("voice").el);
-      unlockFrameAudioEl(getFrameAudioChannel("ambience").el);
-    };
-    unlockAll();
-    window.addEventListener("pointerdown", unlockAll, { passive: true });
-    window.addEventListener("touchend", unlockAll, { passive: true });
-    const channels = frameAudioChannelsRef.current;
-    const objectUrls = frameObjectUrlsRef.current;
+  // APP 卸载时：环境音随 APP 停，voice 频道若归属本 APP 则标记 appClosed 继续播。
+  useEffect(() => {
+    customAppAudioMarkAppOpen(app.id);
     return () => {
-      window.removeEventListener("pointerdown", unlockAll);
-      window.removeEventListener("touchend", unlockAll);
-      for (const entry of channels.values()) {
-        const settle = entry.settle;
-        entry.settle = null;
-        cleanupFrameAudioChannel(entry);
-        settle?.();
-      }
-      channels.clear();
-      for (const url of objectUrls) {
-        try { URL.revokeObjectURL(url); } catch { /* ignore */ }
-      }
-      objectUrls.clear();
+      customAppAudioMarkAppClosed(app.id);
     };
-  }, [getFrameAudioChannel]);
+  }, [app.id]);
 
   const handleUninstall = useCallback(async (deleteData: boolean) => {
     const removal = await removeCustomAppRegistrationsAsync(app.id, { deleteResources: deleteData });
@@ -1366,60 +1293,16 @@ export function CustomAppRunner({
 
     if (action === "voice.play") {
       requirePermission("voice.tts");
-      const channel = normalizeFrameAudioChannelName(record.channel);
-      const rawSrc = String(record.dataUrl ?? record.src ?? record.ref ?? "");
-      let src = rawSrc;
-      let mediaObjectUrl: string | null = null;
-      if (isMediaStoreRef(rawSrc)) {
-        // 媒体库引用:宿主直接读 Blob 转 objectURL,音频数据不过桥
-        const media = await loadMediaBlob(rawSrc);
-        if (!media) throw new Error("voice.play 找不到对应媒体,可能已被删除。");
-        mediaObjectUrl = URL.createObjectURL(media.blob);
-        src = mediaObjectUrl;
-      } else if (!src.startsWith("data:audio/") && !src.startsWith("blob:")) {
-        throw new Error("voice.play 需要音频 dataUrl 或 media-store:// 引用。");
-      }
-      const entry = getFrameAudioChannel(channel);
-      const prevSettle = entry.settle;
-      entry.settle = null;
-      cleanupFrameAudioChannel(entry);
-      prevSettle?.();
-      const el = entry.el;
-      entry.objectUrl = mediaObjectUrl;
-      el.loop = record.loop === true;
-      const volume = Number(record.volume);
-      el.volume = Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : 1;
-      el.src = src;
-      if (el.loop) {
-        try { await el.play(); } catch (err) {
-          cleanupFrameAudioChannel(entry);
-          throw new Error(`宿主音频播放被拦截:${err instanceof Error ? err.message : String(err)}`);
-        }
-        return { ok: true, loop: true };
-      }
-      return await new Promise((resolve, reject) => {
-        let settled = false;
-        const settle = () => {
-          if (settled) return;
-          settled = true;
-          if (entry.settle === settle) entry.settle = null;
-          cleanupFrameAudioChannel(entry);
-          resolve({ ok: true });
-        };
-        const fail = (message: string) => {
-          if (settled) return;
-          settled = true;
-          if (entry.settle === settle) entry.settle = null;
-          cleanupFrameAudioChannel(entry);
-          reject(new Error(message));
-        };
-        entry.settle = settle;
-        el.onended = settle;
-        el.onerror = () => fail("宿主音频解码或播放失败");
-        const p = el.play();
-        if (p && typeof p.catch === "function") {
-          p.catch(err => fail(`宿主音频播放被拦截:${err instanceof Error ? err.message : String(err)}`));
-        }
+      return customAppAudioPlay({
+        channel: record.channel,
+        dataUrl: record.dataUrl,
+        src: record.src,
+        ref: record.ref,
+        loop: record.loop,
+        volume: record.volume,
+        title: record.title,
+        appId: app.id,
+        appName: app.name,
       });
     }
     if (action === "media.put") {
@@ -1462,11 +1345,7 @@ export function CustomAppRunner({
     }
     if (action === "media.revoke") {
       requirePermission("app.data.read");
-      const url = String(record.url ?? record.objectUrl ?? "");
-      if (frameObjectUrlsRef.current.has(url)) {
-        try { URL.revokeObjectURL(url); } catch { /* ignore */ }
-        frameObjectUrlsRef.current.delete(url);
-      }
+      // objectURL 现已由全局音频托管统一管理，APP 侧无需（也无法）主动释放。
       return { ok: true };
     }
     if (action === "media.delete") {
@@ -1482,25 +1361,17 @@ export function CustomAppRunner({
     }
     if (action === "voice.stopPlayback") {
       requirePermission("voice.tts");
-      const entry = frameAudioChannelsRef.current.get(normalizeFrameAudioChannelName(record.channel));
-      if (entry) {
-        const settle = entry.settle;
-        entry.settle = null;
-        cleanupFrameAudioChannel(entry);
-        settle?.();
-      }
+      customAppAudioStop(record.channel);
       return { ok: true };
     }
     if (action === "voice.pausePlayback") {
       requirePermission("voice.tts");
-      const entry = frameAudioChannelsRef.current.get(normalizeFrameAudioChannelName(record.channel));
-      if (entry) { try { entry.el.pause(); } catch { /* ignore */ } }
+      customAppAudioPause(record.channel);
       return { ok: true };
     }
     if (action === "voice.resumePlayback") {
       requirePermission("voice.tts");
-      const entry = frameAudioChannelsRef.current.get(normalizeFrameAudioChannelName(record.channel));
-      if (entry && entry.el.src) { void entry.el.play().catch(() => { /* ignore */ }); }
+      customAppAudioResume(record.channel);
       return { ok: true };
     }
 
@@ -1849,7 +1720,7 @@ export function CustomAppRunner({
     }
 
     throw new Error(`未知 AiPhone 动作：${action}`);
-  }, [app, backgroundEvent, backgroundTool, declaredEvents, declaredToolKeys, getFrameAudioChannel, launchContext, onClose, onNotice, postBackgroundEventIfReady, postBackgroundToolIfReady, postHostEvent, requireAnyPermission, requirePermission]);
+  }, [app, backgroundEvent, backgroundTool, declaredEvents, declaredToolKeys, launchContext, onClose, onNotice, postBackgroundEventIfReady, postBackgroundToolIfReady, postHostEvent, requireAnyPermission, requirePermission]);
 
   useEffect(() => {
     if (isBackgroundRunner) return undefined;
