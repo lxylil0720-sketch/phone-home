@@ -259,7 +259,7 @@ function ensureFloatStyle(): void {
   const style = document.createElement("style");
   style.textContent = `
   .caa-float{position:fixed;left:14px;z-index:2147483000;display:flex;align-items:center;gap:8px;}
-  .caa-float-dot{width:48px;height:48px;border-radius:50%;border:none;background:rgba(22,22,28,.92);color:#fff;box-shadow:0 6px 18px rgba(0,0,0,.35),0 0 0 1px rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;cursor:grab;touch-action:none;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);}
+  .caa-float-dot{width:48px;height:48px;border-radius:50%;border:1px solid rgba(255,255,255,.35);background:rgba(255,255,255,.24);color:rgba(0,0,0,.62);box-shadow:0 6px 18px rgba(0,0,0,.28);display:flex;align-items:center;justify-content:center;cursor:grab;touch-action:none;backdrop-filter:blur(12px) saturate(1.2);-webkit-backdrop-filter:blur(12px) saturate(1.2);}
   .caa-float-dot:active{transform:scale(.95);}
   .caa-float-card{display:none;max-width:210px;background:rgba(22,22,28,.94);color:#eee;border-radius:14px;padding:10px 12px;box-shadow:0 8px 24px rgba(0,0,0,.4);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);}
   .caa-float-card[data-open]{display:block;}
